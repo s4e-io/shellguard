@@ -204,15 +204,26 @@ func loadState() State {
 		logError("WARN", fmt.Sprintf("state.json not found, using defaults: %v", err))
 		return State{Mode: "log only", Enabled: true}
 	}
-	var s State
-	if err := json.Unmarshal(data, &s); err != nil {
-		logError("ERROR", fmt.Sprintf("state.json parse failed: %v", err))
+	// Parse into a raw map so we can distinguish missing field (→ default true)
+	// from explicitly set false. json.Unmarshal zero-fills missing bool fields,
+	// which would incorrectly disable ShellGuard when the field is absent.
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		logError("ERROR", fmt.Sprintf("state.json parse failed, failing safe (log only + enabled): %v", err))
 		return State{Mode: "log only", Enabled: true}
 	}
-	if s.Mode == "" {
-		s.Mode = "log only"
+	mode, _ := raw["mode"].(string)
+	if mode == "" {
+		mode = "log only"
 	}
-	return s
+	// enabled defaults to true when the field is absent
+	enabled := true
+	if v, ok := raw["enabled"]; ok {
+		if b, ok := v.(bool); ok {
+			enabled = b
+		}
+	}
+	return State{Mode: mode, Enabled: enabled}
 }
 
 func loadPolicy() Policy {
@@ -229,9 +240,21 @@ func loadPolicy() Policy {
 	return p
 }
 
-// normalizeCmd strips a leading absolute path so "/usr/bin/touch a" → "touch a".
-// filepath.Base handles any path depth: /usr/bin, /usr/local/bin, /opt/homebrew/bin, etc.
+// normalizeCmd strips leading path prefixes so "/usr/bin/touch a" → "touch a"
+// and "./touch a" → "touch a". Handles absolute paths and relative ./paths.
 func normalizeCmd(cmd string) string {
+	// Strip "./" prefix: "./touch a" → "touch a"
+	if strings.HasPrefix(cmd, "./") {
+		rest := cmd[2:]
+		// Only strip if what follows looks like a command (no additional slashes before space)
+		spaceIdx := strings.Index(rest, " ")
+		if spaceIdx == -1 {
+			return rest
+		}
+		if !strings.Contains(rest[:spaceIdx], "/") {
+			return rest
+		}
+	}
 	if !strings.HasPrefix(cmd, "/") {
 		return cmd
 	}
@@ -242,19 +265,33 @@ func normalizeCmd(cmd string) string {
 	return filepath.Base(cmd)
 }
 
-// unwrapShellC extracts the inner command from "sh -c '...'" style invocations.
-// Handles: sh, bash, zsh, dash, fish — with or without quotes.
+// unwrapShellC extracts the inner command from shell -c / -lc / -cl invocations.
+// Handles: sh, bash, zsh, dash, fish — with any flag combination containing 'c'.
+// Examples: "bash -c 'cmd'", "bash -lc 'cmd'", "bash -cl 'cmd'", "sh -ic 'cmd'".
 func unwrapShellC(cmd string) string {
 	shells := []string{"sh", "bash", "zsh", "dash", "fish"}
 	for _, sh := range shells {
-		prefix := sh + " -c "
-		if strings.HasPrefix(cmd, prefix) {
-			inner := strings.TrimSpace(strings.TrimPrefix(cmd, prefix))
-			if len(inner) >= 2 && (inner[0] == '\'' || inner[0] == '"') {
-				inner = inner[1 : len(inner)-1]
-			}
-			return strings.TrimSpace(inner)
+		if !strings.HasPrefix(cmd, sh+" ") {
+			continue
 		}
+		rest := strings.TrimSpace(cmd[len(sh):])
+		if !strings.HasPrefix(rest, "-") {
+			continue
+		}
+		// Find the flag token (e.g. "-c", "-lc", "-cl")
+		spaceIdx := strings.Index(rest, " ")
+		if spaceIdx == -1 {
+			continue
+		}
+		flags := rest[1:spaceIdx] // strip leading '-'
+		if !strings.Contains(flags, "c") {
+			continue
+		}
+		inner := strings.TrimSpace(rest[spaceIdx+1:])
+		if len(inner) >= 2 && (inner[0] == '\'' || inner[0] == '"') {
+			inner = inner[1 : len(inner)-1]
+		}
+		return strings.TrimSpace(inner)
 	}
 	return ""
 }
@@ -291,7 +328,8 @@ func unwrapExecPrefix(cmd string) string {
 		return strings.Join(parts[1:], " ")
 
 	case "env":
-		// Skip VAR=val assignments and flags; first plain word is the command.
+		// Skip VAR=val assignments, flags, and flag-arguments (e.g. -u VAR).
+		// env flags that consume the next argument: -u (unset), -S (split string).
 		for i := 1; i < len(parts); i++ {
 			p := parts[i]
 			if p == "--" {
@@ -300,9 +338,17 @@ func unwrapExecPrefix(cmd string) string {
 				}
 				return ""
 			}
-			if !strings.Contains(p, "=") && !strings.HasPrefix(p, "-") {
-				return strings.Join(parts[i:], " ")
+			if strings.Contains(p, "=") {
+				continue // VAR=val assignment
 			}
+			if p == "-u" || p == "-S" {
+				i++ // flag that takes the next word as its argument
+				continue
+			}
+			if strings.HasPrefix(p, "-") {
+				continue // boolean flag
+			}
+			return strings.Join(parts[i:], " ")
 		}
 
 	case "sudo", "doas":
@@ -312,8 +358,138 @@ func unwrapExecPrefix(cmd string) string {
 				return strings.Join(parts[i:], " ")
 			}
 		}
+
+	case "command":
+		// "command touch a" → "touch a": 'command' is a shell builtin that
+		// transparently executes its argument, bypassing alias/function lookup.
+		if len(parts) >= 2 {
+			return strings.Join(parts[1:], " ")
+		}
 	}
 	return ""
+}
+
+// stripEnvVarPrefix removes leading VAR=val shell environment assignments.
+// "X=1 Y=2 mkdir foo" → "mkdir foo". These are commonly used to sneak past
+// blocklists by prefixing the real command with an env variable assignment.
+func stripEnvVarPrefix(cmd string) string {
+	parts := strings.Fields(cmd)
+	for i, p := range parts {
+		if strings.Contains(p, "=") && !strings.HasPrefix(p, "-") {
+			continue // this part is VAR=val, keep scanning
+		}
+		if i == 0 {
+			return "" // no prefix to strip
+		}
+		return strings.Join(parts[i:], " ")
+	}
+	return ""
+}
+
+// unwrapParens removes surrounding parentheses: "(touch a)" → "touch a".
+// Prevents bypass via explicit subshell invocation.
+func unwrapParens(cmd string) string {
+	s := strings.TrimSpace(cmd)
+	if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+		return strings.TrimSpace(s[1 : len(s)-1])
+	}
+	return ""
+}
+
+// normalizeRmFlags canonicalises rm commands with combined/reordered flags.
+// "rm -rfv /foo" → "rm -rf /foo", "rm -f -r /foo" → "rm -rf /foo".
+// Returns "" if the command is not rm or has no dangerous flags.
+func normalizeRmFlags(cmd string) string {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 || (parts[0] != "rm" && parts[0] != "/bin/rm" && parts[0] != "/usr/bin/rm") {
+		return ""
+	}
+	hasR, hasF := false, false
+	var targets []string
+	for _, p := range parts[1:] {
+		if p == "--" {
+			break
+		}
+		if strings.HasPrefix(p, "--") {
+			if p == "--recursive" {
+				hasR = true
+			} else if p == "--force" {
+				hasF = true
+			}
+			continue
+		}
+		if strings.HasPrefix(p, "-") {
+			flags := p[1:]
+			if strings.ContainsAny(flags, "rR") {
+				hasR = true
+			}
+			if strings.Contains(flags, "f") {
+				hasF = true
+			}
+			continue
+		}
+		targets = append(targets, p)
+	}
+	if !hasR && !hasF {
+		return ""
+	}
+	var canon string
+	switch {
+	case hasR && hasF:
+		canon = "rm -rf"
+	case hasR:
+		canon = "rm -r"
+	default:
+		return "" // -f alone is not a dangerous pattern we need to canonicalize
+	}
+	if len(targets) > 0 {
+		canon += " " + strings.Join(targets, " ")
+	}
+	return canon
+}
+
+// normalizeGitCmd strips git global options (-C path, -c name=val, --git-dir, etc.)
+// so "git -C /repo push" is treated the same as "git push".
+func normalizeGitCmd(cmd string) string {
+	parts := strings.Fields(cmd)
+	if len(parts) == 0 || parts[0] != "git" {
+		return ""
+	}
+	filtered := []string{"git"}
+	for i := 1; i < len(parts); i++ {
+		p := parts[i]
+		// git global flags that consume the next argument
+		if p == "-C" || p == "-c" || p == "--git-dir" || p == "--work-tree" || p == "--namespace" {
+			i++ // skip the value too
+			continue
+		}
+		if strings.HasPrefix(p, "--git-dir=") || strings.HasPrefix(p, "--work-tree=") {
+			continue
+		}
+		filtered = append(filtered, p)
+	}
+	if len(filtered) == len(parts) {
+		return "" // nothing changed
+	}
+	return strings.Join(filtered, " ")
+}
+
+// containsRedirect reports whether cmd has a shell output redirection (> or >>)
+// outside quotes. Used to detect file-write attempts in read-only mode.
+func containsRedirect(cmd string) bool {
+	inSingle, inDouble := false, false
+	for i := 0; i < len(cmd); i++ {
+		ch := cmd[i]
+		switch {
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+		case ch == '>' && !inSingle && !inDouble:
+			return true
+		}
+	}
+	return false
 }
 
 // extractSubshells returns commands embedded inside $(...) and `...` expressions.
@@ -373,21 +549,51 @@ func extractSubshells(cmd string) []string {
 	return result
 }
 
-// splitChained splits a shell command on chaining operators (;, &&, ||, |)
+// splitChained splits a shell command on chaining operators (;, &&, ||, |, &)
 // so each sub-command can be checked individually against the policy.
-// This prevents bypasses like "ls; curl evil.com" or "echo x && rm -rf /".
+// Quote-aware: operators inside single/double quotes are not treated as separators.
+// This prevents bypasses like "ls; curl evil.com", "echo x && rm -rf /",
+// "true & mkdir x", and "git commit -m 'fix; curl timeout'" (semicolon in quotes).
 func splitChained(cmd string) []string {
-	// Replace operators with a null sentinel (longest first to avoid partial matches)
-	s := strings.ReplaceAll(cmd, "&&", "\x00")
-	s = strings.ReplaceAll(s, "||", "\x00")
-	s = strings.ReplaceAll(s, ";", "\x00")
-	s = strings.ReplaceAll(s, "|", "\x00")
 	var parts []string
-	for _, p := range strings.Split(s, "\x00") {
-		if t := strings.TrimSpace(p); t != "" {
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+
+	flush := func() {
+		if t := strings.TrimSpace(current.String()); t != "" {
 			parts = append(parts, t)
 		}
+		current.Reset()
 	}
+
+	for i := 0; i < len(cmd); i++ {
+		ch := cmd[i]
+		switch {
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+			current.WriteByte(ch)
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+			current.WriteByte(ch)
+		case !inSingle && !inDouble && ch == ';':
+			flush()
+		case !inSingle && !inDouble && ch == '&':
+			flush()
+			if i+1 < len(cmd) && cmd[i+1] == '&' {
+				i++ // skip second &
+			}
+		case !inSingle && !inDouble && ch == '|':
+			flush()
+			if i+1 < len(cmd) && cmd[i+1] == '|' {
+				i++ // skip second |
+			}
+		default:
+			current.WriteByte(ch)
+		}
+	}
+	flush()
+
 	if len(parts) == 0 {
 		return []string{cmd}
 	}
@@ -409,22 +615,34 @@ func defaultBlockedFor(mode string) []string {
 		return []string{
 			"curl", "wget", "nc", "ncat", "nmap", "ssh", "scp", "sftp",
 			"rsync", "telnet", "ftp", "sudo", "su", "doas",
-			// Block all recursive rm variants (flag order matters for prefix matching)
+			// rm -rf in any flag order is caught by normalizeRmFlags → "rm -rf"
 			"rm -r", "rm -rf", "rm -fr", "rm --recursive",
 			"shred", "dd", "chmod", "chown", "chgrp",
-			"git push", "git reset --hard", "git clean -f",
+			// git dangerous ops — match by subcommand without flags (git -C strips global opts)
+			"git push", "git reset", "git clean",
 			"osascript", "launchctl", "crontab", "killall", "pkill",
 		}
 	case "read only":
 		return []string{
+			// File system mutation
 			"rm", "rmdir", "mv", "cp", "touch", "mkdir", "ln", "shred", "dd",
+			"install", "truncate", "tee",
+			// Permission/ownership changes
 			"sudo", "su", "doas", "chmod", "chown", "chgrp",
+			// Network
 			"curl", "wget", "nc", "ncat", "nmap", "ssh", "scp", "sftp",
-			"rsync", "telnet", "ftp", "git push", "git add", "git commit",
-			"git reset", "git clean", "git rm", "npm", "npx", "yarn", "pnpm",
-			"pip", "pip3", "python", "python3", "node", "ruby", "java",
+			"rsync", "telnet", "ftp",
+			// Git write ops
+			"git push", "git add", "git commit", "git reset", "git clean", "git rm",
+			"git stash", "git tag", "git merge", "git rebase",
+			// Package managers / runtime executors that download or mutate state
+			"npm", "npx", "yarn", "pnpm", "pip", "pip3",
+			"python", "python3", "node", "ruby", "java", "go run",
+			// Commands that can write files via flags (-i, -e, etc.)
+			"sed", "perl", "awk",
+			// System management
 			"osascript", "launchctl", "crontab", "at",
-			"kill", "killall", "pkill", "open", ": >",
+			"kill", "killall", "pkill", "open",
 		}
 	}
 	return nil
@@ -432,6 +650,8 @@ func defaultBlockedFor(mode string) []string {
 
 // buildCandidates returns the set of normalized forms to check against patterns.
 // Normalizes internal whitespace so "curl\thttp://evil.com" matches "curl".
+// Handles absolute paths, relative ./paths, env var prefixes, subshells, exec wrappers,
+// shell -c/-lc invocations, rm flag reordering, and git global options.
 func buildCandidates(rawSegment string) []string {
 	// Collapse all whitespace to single spaces — prevents tab/Unicode bypass.
 	cmd := strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(rawSegment))), " ")
@@ -445,17 +665,35 @@ func buildCandidates(rawSegment string) []string {
 	}
 
 	add(cmd)
-	add(normalizeCmd(cmd))
+	normed := normalizeCmd(cmd)
+	add(normed)
 
-	if inner := unwrapShellC(normalizeCmd(cmd)); inner != "" {
+	// Strip surrounding parens: "(touch a)" → "touch a"
+	if inner := unwrapParens(normed); inner != "" {
 		add(inner)
 		add(normalizeCmd(inner))
 	}
-	if inner := unwrapXargs(normalizeCmd(cmd)); inner != "" {
+
+	// Strip leading env var assignments: "X=1 mkdir foo" → "mkdir foo"
+	if inner := stripEnvVarPrefix(normed); inner != "" {
 		add(inner)
 		add(normalizeCmd(inner))
 	}
-	if inner := unwrapExecPrefix(normalizeCmd(cmd)); inner != "" {
+
+	// shell -c/-lc unwrap
+	if inner := unwrapShellC(normed); inner != "" {
+		add(inner)
+		add(normalizeCmd(inner))
+	}
+
+	// xargs unwrap
+	if inner := unwrapXargs(normed); inner != "" {
+		add(inner)
+		add(normalizeCmd(inner))
+	}
+
+	// exec-prefix unwrap (env, nohup, sudo, command, …)
+	if inner := unwrapExecPrefix(normed); inner != "" {
 		add(inner)
 		add(normalizeCmd(inner))
 		// One level of recursive unwrap: "sudo nohup curl …"
@@ -463,6 +701,16 @@ func buildCandidates(rawSegment string) []string {
 			add(inner2)
 			add(normalizeCmd(inner2))
 		}
+	}
+
+	// rm flag canonicalization: "rm -rfv" → "rm -rf", "rm -f -r" → "rm -rf"
+	if canon := normalizeRmFlags(normed); canon != "" {
+		add(canon)
+	}
+
+	// git global option stripping: "git -C /path push" → "git push"
+	if canon := normalizeGitCmd(normed); canon != "" {
+		add(canon)
 	}
 
 	result := make([]string, 0, len(seen))
@@ -507,7 +755,22 @@ func checkSegment(segment string, blockedPatterns, allowedPatterns []string) (bl
 	return false, ""
 }
 
+// validModes is the set of mode names ShellGuard recognises.
+var validModes = map[string]bool{
+	"log only": true,
+	"dev":      true,
+	"read only": true,
+	"custom":   true,
+}
+
 func isBlocked(command, mode string, policy Policy) (bool, string) {
+	// Unknown mode → fail to most restrictive to prevent policy bypass via
+	// a crafted or typo'd mode name.
+	if !validModes[mode] {
+		logError("WARN", fmt.Sprintf("unknown mode %q — failing to read only for safety", mode))
+		mode = "read only"
+	}
+
 	rules, hasPolicyRules := policy.Modes[mode]
 	blockedPatterns := rules.Blocked
 	if !hasPolicyRules || len(blockedPatterns) == 0 {
@@ -517,6 +780,12 @@ func isBlocked(command, mode string, policy Policy) (bool, string) {
 	// allowedPatterns: only enforced when explicitly defined in policy.yaml.
 	// Empty = blocklist-only model (no restriction on what else can run).
 	allowedPatterns := rules.Allowed
+
+	// In read-only mode, block shell redirections (> / >>) regardless of command.
+	// These allow writing files without invoking any blocked command binary.
+	if mode == "read only" && containsRedirect(command) {
+		return true, fmt.Sprintf("shell output redirection (>) is blocked in read-only mode (mode: %s)", mode)
+	}
 
 	segments := splitChained(command)
 	for _, segment := range segments {
@@ -543,7 +812,7 @@ func logEvent(entry LogEntry) {
 		logError("ERROR", fmt.Sprintf("failed to marshal log entry: %v", err))
 		return
 	}
-	f, err := os.OpenFile(activityLogFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(activityLogFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		logError("ERROR", fmt.Sprintf("failed to open activity log: %v", err))
 		return
@@ -581,21 +850,21 @@ func check(command, process, entryType string) int {
 
 	mode := strings.ToLower(strings.TrimSpace(state.Mode))
 
-	if mode == "log only" || mode == "log_only" {
+	// Normalize mode aliases: "read_only" → "read only", "log_only" → "log only"
+	mode = strings.ReplaceAll(mode, "_", " ")
+
+	if mode == "log only" {
 		logEvent(LogEntry{Timestamp: ts, Command: command, Reason: "Logged (log-only mode)",
 			User: user, Process: process, PID: pid, Blocked: false, Type: entryType})
 		return 0
 	}
 
-	// Normalize mode key to match policy.yaml (e.g. "read_only" → "read only")
-	modeKey := strings.ReplaceAll(mode, "_", " ")
-
-	blocked, reason := isBlocked(command, modeKey, policy)
+	blocked, reason := isBlocked(command, mode, policy)
 	if blocked {
 		logEvent(LogEntry{Timestamp: ts, Command: command, Reason: reason,
 			User: user, Process: process, PID: pid, Blocked: true, Type: entryType})
 		fmt.Fprintf(os.Stderr, "[ShellGuard] Blocked: %s\n", reason)
-		return 2 // exit 2 = Claude Code PreToolUse block signal
+		return 2
 	}
 
 	logEvent(LogEntry{Timestamp: ts, Command: command, Reason: "Allowed",
