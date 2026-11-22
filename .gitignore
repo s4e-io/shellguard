@@ -1,0 +1,68 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Xcode / SwiftPM
+.build/
+DerivedData/
+Packages/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+xcuserdata/
+
+# Swift app archives and symbols
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Go
+bin/
+dist/
+/shellguard
+coverage.out
+*.coverprofile
+*.test
+vendor/
+
+# Logs and runtime state
+*.log
+*.out
+*.pid
+*.pid.lock
+tmp/
+.tmp/
+run/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+secrets/
+
+# Shell Guard local state
+.shellguard/
+events.jsonl
+shellguard.local.toml
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Windows setup build input (scripts/build-windows.sh)
+cmd/shellguard-setup/payload/
