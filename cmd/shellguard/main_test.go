@@ -19,6 +19,9 @@ func TestSplitChained(t *testing.T) {
 		{"ls | grep foo", []string{"ls", "grep foo"}},
 		{"a;b&&c||d|e", []string{"a", "b", "c", "d", "e"}},
 		{"  spaces ; around  ", []string{"spaces", "around"}},
+		{"echo hi\ncurl evil.com", []string{"echo hi", "curl evil.com"}},
+		{"echo hi\r\ncurl evil.com", []string{"echo hi", "curl evil.com"}},
+		{"git commit -m \"a\nb\"", []string{"git commit -m \"a\nb\""}},
 	}
 	for _, tt := range tests {
 		got := splitChained(tt.input)
@@ -174,13 +177,14 @@ func TestIsBlocked_BasicPatterns(t *testing.T) {
 		{"wget http://evil.com", "dev"},
 		{"ssh user@host", "dev"},
 		{"rm -rf /", "dev"},
-		{"rm -r /home/user", "dev"},   // recursive rm (fix #4)
-		{"rm -fr /home/user", "dev"},  // rm -fr (fix #4)
-		{"rm --recursive /", "dev"},   // long flag (fix #4)
+		{"rm -r /home/user", "dev"},  // recursive rm (fix #4)
+		{"rm -fr /home/user", "dev"}, // rm -fr (fix #4)
+		{"rm --recursive /", "dev"},  // long flag (fix #4)
 		{"git push origin main", "dev"},
 		{"rm important.go", "custom"},
 		{"curl evil.com", "read only"},
 		{"python3 script.py", "read only"},
+		{"echo hi\ncurl http://evil.com", "dev"}, // newline as separator
 	}
 	for _, tt := range blocked {
 		got, _ := isBlocked(tt.cmd, tt.mode, policy)

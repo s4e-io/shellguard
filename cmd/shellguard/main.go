@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -36,13 +39,16 @@ func configDir() string {
 
 func activityLogFile() string { return filepath.Join(configDir(), "activity.log") }
 func errorLogFile() string    { return filepath.Join(configDir(), "shellguard.log") }
-func stateFile() string       { return filepath.Join(configDir(), "state.json") }
-func policyFile() string      { return filepath.Join(configDir(), "policy.yaml") }
+func policyFile() string      { return configFile("policy.yaml") }
+
+// stateFile prefers the admin-managed state.json (see managed.go), so an
+// enterprise install can pin the mode — e.g. "log only" — for every user.
+func stateFile() string { return configFile("state.json") }
 
 // logError writes a diagnostic entry to shellguard.log (not the activity log).
 func logError(level, msg string) {
 	_ = os.MkdirAll(configDir(), 0755)
-	f, err := os.OpenFile(errorLogFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(errorLogFile(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return
 	}
@@ -90,7 +96,7 @@ type hookFields struct {
 	eventKind      string // "pre" | "post" | "unknown"
 	process        string // originating tool name
 	reason         string // post-execution outcome summary
-	responseFormat string // "exitcode" | "json"
+	responseFormat string // "exitcode" | "cursor" (JSON permission on stdout)
 }
 
 // extractHookFields pulls the fields we care about from an arbitrary JSON map.
@@ -101,8 +107,18 @@ func extractHookFields(m map[string]any) (hookFields, bool) {
 	// Different AI tools use different field names inside tool_input:
 	//   Claude Code / Codex:  tool_input.command  (string)
 	//   Codex (alt):          tool_input.cmd       (string)
-	//   Fallback:             top-level command    (string)
-	if ti, ok := m["tool_input"].(map[string]any); ok {
+	//   Cursor:               top-level command    (string)
+	//   VS Code / Copilot:    tool_input may be a JSON-encoded string;
+	//                         camelCase payloads use toolName / toolArgs
+	rawInput := m["tool_input"]
+	if rawInput == nil {
+		rawInput = m["toolArgs"]
+	}
+	ti, _ := rawInput.(map[string]any)
+	if s, ok := rawInput.(string); ok {
+		_ = json.Unmarshal([]byte(s), &ti)
+	}
+	if ti != nil {
 		f.command, _ = ti["command"].(string)
 		if f.command == "" {
 			f.command, _ = ti["cmd"].(string)
@@ -120,22 +136,27 @@ func extractHookFields(m map[string]any) (hookFields, bool) {
 	//   Cursor:        "shell"
 	//   Codex CLI:     "shell_command"  ← confirmed from binary strings
 	//   Gemini CLI:    "run_shell_command"
-	toolName := strings.ToLower(strings.TrimSpace(str(m["tool_name"])))
-	if toolName != "" &&
-		toolName != "bash" &&
-		toolName != "shell" &&
-		toolName != "shell_command" &&
-		toolName != "run_shell_command" {
+	//   Copilot / Claude Code on Windows: "powershell"
+	//   VS Code:       "run_in_terminal"
+	name := str(m["tool_name"])
+	if name == "" {
+		name = str(m["toolName"])
+	}
+	toolName := strings.ToLower(strings.TrimSpace(name))
+	switch toolName {
+	case "", "bash", "shell", "shell_command", "run_shell_command", "powershell", "run_in_terminal", "runinterminal":
+	default:
 		return f, false
 	}
 
 	// ── event kind ───────────────────────────────────────────────────────────
 	// Normalise any casing / separator variant to "pre" or "post".
+	// Cursor uses beforeShellExecution / afterShellExecution.
 	event := strings.ToLower(strings.ReplaceAll(str(m["hook_event_name"]), "_", ""))
 	switch {
-	case strings.Contains(event, "pre"):
+	case strings.Contains(event, "pre"), strings.HasPrefix(event, "before"):
 		f.eventKind = "pre"
-	case strings.Contains(event, "post"):
+	case strings.Contains(event, "post"), strings.HasPrefix(event, "after"):
 		f.eventKind = "post"
 	}
 
@@ -155,10 +176,15 @@ func extractHookFields(m map[string]any) (hookFields, bool) {
 		f.process = "codex"
 	case str(m["conversation_id"]) != "": // Cursor
 		f.process = "cursor"
-	case str(m["session_id"]) != "": // Claude Code
+	case str(m["session_id"]) != "": // Claude Code (also VS Code / Copilot — use --source)
 		f.process = "claude"
 	}
 	f.responseFormat = "exitcode"
+	// Cursor reads a JSON decision from stdout when the hook exits 0.
+	if str(m["cursor_version"]) != "" || f.process == "cursor" {
+		f.process = "cursor"
+		f.responseFormat = "cursor"
+	}
 
 	// ── post-execution outcome ────────────────────────────────────────────────
 	f.reason = "Executed"
@@ -199,7 +225,10 @@ func mapKeys(m map[string]any) []string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func loadState() State {
-	data, err := os.ReadFile(stateFile())
+	data, err := readConfig("state.json")
+	if errors.Is(err, errPolicyRejected) {
+		return State{Mode: "log only", Enabled: true}
+	}
 	if err != nil {
 		logError("WARN", fmt.Sprintf("state.json not found, using defaults: %v", err))
 		return State{Mode: "log only", Enabled: true}
@@ -227,7 +256,7 @@ func loadState() State {
 }
 
 func loadPolicy() Policy {
-	data, err := os.ReadFile(policyFile())
+	data, err := readConfig("policy.yaml")
 	if err != nil {
 		logError("WARN", fmt.Sprintf("policy.yaml not found: %v", err))
 		return Policy{}
@@ -550,10 +579,11 @@ func extractSubshells(cmd string) []string {
 }
 
 // splitChained splits a shell command on chaining operators (;, &&, ||, |, &)
-// so each sub-command can be checked individually against the policy.
+// and newlines so each sub-command can be checked individually against the policy.
 // Quote-aware: operators inside single/double quotes are not treated as separators.
 // This prevents bypasses like "ls; curl evil.com", "echo x && rm -rf /",
-// "true & mkdir x", and "git commit -m 'fix; curl timeout'" (semicolon in quotes).
+// "true & mkdir x", "echo hi<newline>curl evil.com" and
+// "git commit -m 'fix; curl timeout'" (semicolon in quotes).
 func splitChained(cmd string) []string {
 	var parts []string
 	var current strings.Builder
@@ -576,7 +606,7 @@ func splitChained(cmd string) []string {
 		case ch == '"' && !inSingle:
 			inDouble = !inDouble
 			current.WriteByte(ch)
-		case !inSingle && !inDouble && ch == ';':
+		case !inSingle && !inDouble && (ch == ';' || ch == '\n' || ch == '\r'):
 			flush()
 		case !inSingle && !inDouble && ch == '&':
 			flush()
@@ -757,10 +787,10 @@ func checkSegment(segment string, blockedPatterns, allowedPatterns []string) (bl
 
 // validModes is the set of mode names ShellGuard recognises.
 var validModes = map[string]bool{
-	"log only": true,
-	"dev":      true,
+	"log only":  true,
+	"dev":       true,
 	"read only": true,
-	"custom":   true,
+	"custom":    true,
 }
 
 func isBlocked(command, mode string, policy Policy) (bool, string) {
@@ -807,6 +837,7 @@ func isBlocked(command, mode string, policy Policy) (bool, string) {
 
 func logEvent(entry LogEntry) {
 	_ = os.MkdirAll(configDir(), 0755)
+	entry = sanitizeForLog(entry)
 	data, err := json.Marshal(entry)
 	if err != nil {
 		logError("ERROR", fmt.Sprintf("failed to marshal log entry: %v", err))
@@ -817,8 +848,23 @@ func logEvent(entry LogEntry) {
 		logError("ERROR", fmt.Sprintf("failed to open activity log: %v", err))
 		return
 	}
-	defer f.Close()
+	ensurePrivate(f)
 	_, _ = f.WriteString(string(data) + "\n")
+	f.Close()
+
+	forwardToSIEM(entry)
+}
+
+// currentUser returns the OS account running ShellGuard. $USER is only a
+// fallback: it is unset on Windows and trivially spoofed by the caller.
+func currentUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	if u := os.Getenv("USER"); u != "" {
+		return u
+	}
+	return os.Getenv("USERNAME")
 }
 
 func currentProcess() string {
@@ -834,18 +880,20 @@ func currentProcess() string {
 
 // ── Core check logic ──────────────────────────────────────────────────────────
 
-func check(command, process, entryType string) int {
+// check logs the command and applies the active mode. Returns the exit code
+// (0 allow, 2 block) and, when blocked, the reason.
+func check(command, process, entryType string) (int, string) {
 	state := loadState()
 	policy := loadPolicy()
 
-	user := os.Getenv("USER")
+	user := currentUser()
 	pid := fmt.Sprintf("%d", os.Getppid())
 	ts := time.Now().UTC().Format("2006-01-02T15:04:05.999999")
 
 	if !state.Enabled {
 		logEvent(LogEntry{Timestamp: ts, Command: command, Reason: "ShellGuard disabled — pass-through",
 			User: user, Process: process, PID: pid, Blocked: false, Type: entryType})
-		return 0
+		return 0, ""
 	}
 
 	mode := strings.ToLower(strings.TrimSpace(state.Mode))
@@ -856,7 +904,7 @@ func check(command, process, entryType string) int {
 	if mode == "log only" {
 		logEvent(LogEntry{Timestamp: ts, Command: command, Reason: "Logged (log-only mode)",
 			User: user, Process: process, PID: pid, Blocked: false, Type: entryType})
-		return 0
+		return 0, ""
 	}
 
 	blocked, reason := isBlocked(command, mode, policy)
@@ -864,12 +912,45 @@ func check(command, process, entryType string) int {
 		logEvent(LogEntry{Timestamp: ts, Command: command, Reason: reason,
 			User: user, Process: process, PID: pid, Blocked: true, Type: entryType})
 		fmt.Fprintf(os.Stderr, "[ShellGuard] Blocked: %s\n", reason)
-		return 2
+		return 2, reason
 	}
 
 	logEvent(LogEntry{Timestamp: ts, Command: command, Reason: "Allowed",
 		User: user, Process: process, PID: pid, Blocked: false, Type: entryType})
-	return 0
+	return 0, ""
+}
+
+// respond reports a pre-execution decision in the format the AI tool expects
+// and exits. Exit code 2 blocks in every supported tool.
+func respond(f hookFields, code int, reason string) {
+	if f.responseFormat == "cursor" {
+		out := map[string]string{"permission": "allow"}
+		if code != 0 {
+			out = map[string]string{
+				"permission":    "deny",
+				"user_message":  "[ShellGuard] Blocked: " + reason,
+				"agent_message": "ShellGuard policy blocked this command: " + reason,
+			}
+		}
+		data, _ := json.Marshal(out)
+		fmt.Println(string(data))
+	}
+	os.Exit(code)
+}
+
+// sourceOverride returns the value of `--source <name>` from the hook command
+// line, letting a hook config label tools whose payloads look alike.
+func sourceOverride() string {
+	args := os.Args[1:]
+	for i, a := range args {
+		if a == "--source" && i+1 < len(args) {
+			return strings.ToLower(strings.TrimSpace(args[i+1]))
+		}
+		if v, ok := strings.CutPrefix(a, "--source="); ok {
+			return strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	return ""
 }
 
 // ── Modes ─────────────────────────────────────────────────────────────────────
@@ -883,11 +964,18 @@ func hookMode() {
 	_ = os.MkdirAll(configDir(), 0755)
 	debugFile := filepath.Join(configDir(), "last_hook_input.json")
 	_ = os.Remove(debugFile)
-	_ = os.WriteFile(debugFile, raw, 0600)
+	debugRaw := raw
+	if len(debugRaw) > maxLoggedField {
+		debugRaw = debugRaw[:maxLoggedField]
+	}
+	_ = os.WriteFile(debugFile, []byte(redact(string(debugRaw), defaultRedactors)), 0600)
+
+	// Cursor on Windows prefixes the payload with a UTF-8 BOM.
+	raw = bytes.TrimPrefix(raw, []byte("\xef\xbb\xbf"))
 
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil {
-		logError("ERROR", fmt.Sprintf("hook input JSON parse failed: %v — raw: %.200s", err, string(raw)))
+		logError("ERROR", fmt.Sprintf("hook input JSON parse failed: %v — raw: %.200s", err, redact(string(raw), defaultRedactors)))
 		os.Exit(0)
 	}
 
@@ -895,13 +983,16 @@ func hookMode() {
 	if !ok {
 		os.Exit(0)
 	}
+	if src := sourceOverride(); src != "" {
+		f.process = src
+	}
 	if f.command == "" {
 		logError("WARN", fmt.Sprintf("hook received with empty command: event=%q process=%q raw_keys=%v", str(m["hook_event_name"]), f.process, mapKeys(m)))
 		os.Exit(0)
 	}
 
 	ts := time.Now().UTC().Format("2006-01-02T15:04:05.999999")
-	user := os.Getenv("USER")
+	user := currentUser()
 	pid := fmt.Sprintf("%d", os.Getppid())
 
 	switch f.eventKind {
@@ -910,7 +1001,8 @@ func hookMode() {
 			User: user, Process: f.process, PID: pid, Blocked: false, Type: "execution"})
 		os.Exit(0)
 	case "pre":
-		os.Exit(check(f.command, f.process, "suggestion"))
+		code, reason := check(f.command, f.process, "suggestion")
+		respond(f, code, reason)
 	default:
 		// Unknown event kind: fail-safe.
 		// If the payload has evidence it already ran (tool_response / tool_output),
@@ -924,7 +1016,8 @@ func hookMode() {
 			os.Exit(0)
 		}
 		logError("WARN", fmt.Sprintf("unknown hook event kind %q from process=%q — applying pre-check", str(m["hook_event_name"]), f.process))
-		os.Exit(check(f.command, f.process, "suggestion"))
+		code, reason := check(f.command, f.process, "suggestion")
+		respond(f, code, reason)
 	}
 }
 
@@ -933,7 +1026,7 @@ func wrapperMode(args []string) {
 	shell, shellFlag := shellBinary()
 	if len(args) >= 2 && args[0] == "-c" {
 		command := args[1]
-		code := check(command, currentProcess(), "execution")
+		code, _ := check(command, currentProcess(), "execution")
 		if code != 0 {
 			os.Exit(code)
 		}
@@ -977,10 +1070,22 @@ func truncate(s string, n int) string {
 func main() {
 	args := os.Args[1:]
 
+	// shellguard --send — replay events queued while the SIEM was unreachable
+	if len(args) >= 1 && (args[0] == "--send" || args[0] == "send") {
+		sendMode(args[1:])
+		return
+	}
+
+	// shellguard --redact-log — mask credentials in an existing activity.log
+	if len(args) >= 1 && args[0] == "--redact-log" {
+		redactLogMode()
+		return
+	}
+
 	// shellguard check "some command"
 	if len(args) >= 1 && args[0] == "check" {
 		command := strings.Join(args[1:], " ")
-		code := check(command, "cli", "execution")
+		code, _ := check(command, "cli", "execution")
 		if code == 0 {
 			fmt.Printf("[ShellGuard] Allowed: %s\n", command)
 		}

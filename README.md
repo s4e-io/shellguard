@@ -5,12 +5,12 @@
 
   [![Release](https://img.shields.io/github/v/release/s4e-io/shellguard?style=flat-square)](https://github.com/s4e-io/shellguard/releases)
   [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
-  [![Go](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat-square&logo=go)](https://golang.org)
+  [![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat-square&logo=go)](https://golang.org)
   [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey?style=flat-square)](https://github.com/s4e-io/shellguard/releases)
 </div>
 
-> **⚠️ Beta — Internal Use**
-> ShellGuard is under active development and not yet production-ready. Hook support for Gemini CLI (Antigravity) and Claude CLI may be incomplete or unreliable. Use at your own risk and expect breaking changes between releases. Currently developed for internal use at [s4e.io](https://s4e.io).
+> **⚠️ Beta**
+> ShellGuard is under active development. Hook support for Gemini CLI (Antigravity) may be incomplete. Expect breaking changes between releases.
 
 ---
 
@@ -68,6 +68,17 @@ chmod +x shellguard && sudo mv shellguard /usr/local/bin/
 Invoke-WebRequest -Uri "https://github.com/s4e-io/shellguard/releases/latest/download/shellguard-windows-amd64.exe" `
   -OutFile "$env:USERPROFILE\bin\shellguard.exe"
 ```
+
+**Windows (installer, all supported tools)**
+
+`ShellGuardSetup-amd64.exe` installs the binary in log only mode and writes the hooks for Cursor, Claude Code, VS Code Copilot and JetBrains Junie. For fleets, the MSI does the same machine-wide (GPO, Intune, SCCM):
+```powershell
+.\ShellGuardSetup-amd64.exe install                     # current user
+.\ShellGuardSetup-amd64.exe install --machine `
+  --siem-host qradar.example.com --siem-protocol tls    # all users, as Administrator
+msiexec /i ShellGuard-<version>-x64.msi /qn SIEMHOST=qradar.example.com SIEMPROTOCOL=tls
+```
+See [docs/WINDOWS_TESTING.md](docs/WINDOWS_TESTING.md) for parameters and verification.
 
 > **macOS users:** The [ShellGuard Mac app](https://github.com/s4e-io/shellguard-ui-mac) installs the binary automatically and provides a menu bar UI for managing modes, hooks, and logs.
 
@@ -144,22 +155,20 @@ Pick your tool below and add the one-time config change. ShellGuard automaticall
 }
 ```
 
-#### VS Code (Copilot / Cline / Continue)
-ShellGuard registers as a terminal profile so all agent-spawned terminals route through it.
+#### VS Code (GitHub Copilot agent)
+Copilot's agent hooks (a Preview feature in VS Code) call ShellGuard before and after each terminal command.
 
-`settings.json` (macOS path: `~/Library/Application Support/Code/User/settings.json`)
+`~/.copilot/hooks/shellguard.json`
 ```json
 {
-  "terminal.integrated.profiles.osx": {
-    "ShellGuard": {
-      "path": "/usr/local/bin/shellguard",
-      "args": []
-    }
-  },
-  "terminal.integrated.defaultProfile.osx": "ShellGuard"
+  "version": 1,
+  "hooks": {
+    "PreToolUse":  [{ "type": "command", "command": "shellguard --source vscode", "timeoutSec": 10 }],
+    "PostToolUse": [{ "type": "command", "command": "shellguard --source vscode", "timeoutSec": 10 }]
+  }
 }
 ```
-> Replace `osx` with `linux` or `windows` as needed.
+> Use PascalCase event names. Setting ShellGuard as the VS Code terminal profile does not work: it opens an interactive shell without checking anything. See [docs/SETTINGS.md](docs/SETTINGS.md) for details.
 
 ---
 
@@ -239,16 +248,27 @@ Every command is appended as a JSON line:
 | `blocked` | `true` = ShellGuard stopped it |
 | `type` | `suggestion` (PreToolUse) · `execution` (PostToolUse) |
 
+### siem.yaml (QRadar / syslog)
+
+Forward every event to your SIEM as LEEF over syslog:
+```yaml
+enabled: true
+host: qradar.example.com
+protocol: tls   # tls | tcp | udp | https (Splunk HEC / JSON)
+format: leef    # leef | cef | json   (https: hec | json)
+```
+Events are queued locally and shipped by a background sender, so hooks never wait on the network. `shellguard --send` drains the queue manually and sends a heartbeat. Credentials in commands are masked before they are written to `activity.log` or leave the machine; `shellguard --redact-log` masks a log written by an older version. See [docs/SETTINGS.md](docs/SETTINGS.md#siemyaml) for managed config, signed config, delivery guarantees and limits.
+
 ---
 
 ## How It Works
 
 ShellGuard runs in two modes depending on invocation:
 
-**Hook mode** (Claude Code, Cursor, Codex, Gemini)
+**Hook mode** (Claude Code, Cursor, Codex, Gemini, VS Code Copilot, Junie)
 The AI tool pipes a JSON payload to stdin before executing. ShellGuard parses it, runs the policy check, and exits `0` (allow) or `2` (block). Exit `2` is the standard PreToolUse block signal.
 
-**Wrapper mode** (VS Code)
+**Wrapper mode** (`shellguard -c`)
 ShellGuard acts as the shell itself (`shellguard -c "cmd"`). If the policy allows it, ShellGuard execs the real shell with the command. Otherwise it exits with an error.
 
 **Bypass protection**
@@ -269,12 +289,17 @@ ShellGuard splits and checks every segment of chained commands:
 
 ```
 shellguard/                      ← this repo (CLI, all platforms)
-├── cmd/shellguard/
-│   └── main.go                  ← single-file binary (intentional)
+├── cmd/
+│   ├── shellguard/              ← the hook binary (policy, logging, SIEM)
+│   ├── shellguard-setup/        ← headless Windows installer
+│   └── shellguard-sign/         ← signs managed config for strict builds
+├── packaging/windows/           ← MSI definition (wixl)
 ├── docs/
-│   ├── SETTINGS.md              ← per-tool hook config reference
-│   └── TESTING.md
+│   ├── SETTINGS.md              ← per-tool hook config, SIEM, managed config
+│   ├── TESTING.md
+│   └── WINDOWS_TESTING.md
 ├── scripts/
+│   ├── build-windows.sh         ← setup exe + MSI
 │   └── uninstall.sh
 ├── .github/
 │   └── workflows/
@@ -317,20 +342,17 @@ GOOS=darwin  GOARCH=arm64 go build -o shellguard-darwin-arm64      ./cmd/shellgu
 
 PRs are welcome. A few principles:
 
-- **Single file.** `main.go` is one file on purpose — easy to read, easy to audit, easy to vendor. Don't split it without a strong reason.
-- **No new dependencies.** `gopkg.in/yaml.v3` is the only allowed dep. Everything else is stdlib.
+- **Keep it auditable.** The policy check lives in `cmd/shellguard/main.go` so it can be read in one sitting. Keep the hook path small and easy to follow.
+- **No new dependencies.** Only `gopkg.in/yaml.v3` and `golang.org/x/sys`. Everything else is stdlib.
 - **Test bypass vectors.** If you add a new bypass detection, add a test for it.
 - **New AI tool support?** Add detection logic to `extractHookFields()` and document the hook config in `docs/SETTINGS.md`.
 
 ### Roadmap
 
-- [ ] `shellguard check "cmd"` — dry-run from the command line
 - [ ] `shellguard tail` — live tail of `activity.log`
-- [ ] Allow-list mode in addition to block-list
 - [ ] Homebrew formula
 - [ ] Shell completions
 - [ ] Windows: full hook mode support (Claude Code on WSL)
-- [ ] Structured test suite
 
 ---
 

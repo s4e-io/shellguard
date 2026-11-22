@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ShellGuard machine-wide MSI (built with wixl from msitools: scripts/build-windows.sh).
+
+  The MSI installs ShellGuardSetup.exe under Program Files and runs
+  `ShellGuardSetup.exe install - -machine` as SYSTEM; uninstall runs
+  `uninstall - -machine`. Silent deployment (Intune / GPO / SCCM):
+
+    msiexec /i ShellGuard.msi /qn SIEMHOST=qradar.corp SIEMPORT=6514 SIEMPROTOCOL=tls
+    msiexec /i ShellGuard.msi /qn SIEMPROTOCOL=https SIEMFORMAT=hec SIEMURL=https://splunk:8088/services/collector/event SIEMTOKEN=...
+    msiexec /i ShellGuard.msi /qn CONFIGDIR=\\fileserver\shellguard   (pre-signed state.json / policy.yaml / siem.yaml)
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="ShellGuard" Language="1033" Version="$(var.Version)" Manufacturer="S4E"
+           UpgradeCode="6F1C2A1E-5B7D-4C8E-9A3F-2D4B6E8C0A15">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
+             Description="ShellGuard — AI agent shell command audit" Comments="Version $(var.Version)"/>
+    <Media Id="1" Cabinet="shellguard.cab" EmbedCab="yes"/>
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of ShellGuard is already installed."/>
+
+    <Property Id="SIEMHOST" Secure="yes"/>
+    <Property Id="SIEMPORT" Value="0" Secure="yes"/>
+    <Property Id="SIEMPROTOCOL" Value="tls" Secure="yes"/>
+    <Property Id="SIEMFORMAT" Secure="yes"/>
+    <Property Id="SIEMURL" Secure="yes"/>
+    <Property Id="SIEMTOKEN" Secure="yes"/>
+    <Property Id="SIEMCA" Secure="yes"/>
+    <Property Id="CONFIGDIR" Secure="yes"/>
+    <Property Id="TOOLS" Secure="yes"/>
+    <!-- keep the token out of verbose MSI logs -->
+    <Property Id="MsiHiddenProperties" Value="SIEMTOKEN"/>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="ShellGuard">
+          <Component Id="SetupExe" Guid="3C5E7A9B-1D2F-4A6C-8E0B-7F9D1B3A5C27" Win64="yes">
+            <File Id="ShellGuardSetupExe" Name="ShellGuardSetup.exe" Source="$(var.SetupExe)" KeyPath="yes"/>
+          </Component>
+        </Directory>
+      </Directory>
+    </Directory>
+
+    <Feature Id="Main" Level="1">
+      <ComponentRef Id="SetupExe"/>
+    </Feature>
+
+    <!-- Deferred EXE actions get their command line formatted when the script
+         is generated, so the properties below are resolved. HideTarget keeps
+         the command line (with SIEMTOKEN) out of the MSI log. -->
+    <CustomAction Id="SetupInstall" FileKey="ShellGuardSetupExe" Execute="deferred" Impersonate="no" Return="check" HideTarget="yes"
+                  ExeCommand="install --machine --siem-host &quot;[SIEMHOST]&quot; --siem-port [SIEMPORT] --siem-protocol &quot;[SIEMPROTOCOL]&quot; --siem-format &quot;[SIEMFORMAT]&quot; --siem-url &quot;[SIEMURL]&quot; --siem-token &quot;[SIEMTOKEN]&quot; --siem-ca &quot;[SIEMCA]&quot; --config-dir &quot;[CONFIGDIR]&quot; --tools &quot;[TOOLS]&quot;"/>
+    <!-- A failed install is rolled back by removing whatever hooks were written. -->
+    <CustomAction Id="SetupRollback" FileKey="ShellGuardSetupExe" ExeCommand="uninstall --machine" Execute="rollback" Impersonate="no" Return="ignore"/>
+    <CustomAction Id="SetupUninstall" FileKey="ShellGuardSetupExe" ExeCommand="uninstall --machine" Execute="deferred" Impersonate="no" Return="ignore"/>
+
+    <InstallExecuteSequence>
+      <Custom Action="SetupRollback" After="InstallFiles">NOT REMOVE</Custom>
+      <Custom Action="SetupInstall" After="SetupRollback">NOT REMOVE</Custom>
+      <Custom Action="SetupUninstall" Before="RemoveFiles">REMOVE="ALL" AND NOT UPGRADINGPRODUCTCODE</Custom>
+    </InstallExecuteSequence>
+  </Product>
+</Wix>
